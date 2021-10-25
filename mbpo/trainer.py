@@ -22,6 +22,7 @@ class MBPOTrainer(BaseTrainer):
             save_video_demo_interval=10000,
             num_steps_per_iteration=1,
             log_interval=100,
+            model_env_ratio=0.8,
             load_dir="",
             **kwargs):
         self.agent = agent
@@ -45,12 +46,16 @@ class MBPOTrainer(BaseTrainer):
         self.save_video_demo_interval = save_video_demo_interval
         self.start_timestep = start_timestep
         self.log_interval = log_interval
+        self.model_env_ratio = model_env_ratio
         if load_dir != "" and os.path.exists(load_dir):
             self.agent.load(load_dir)
 
     def warmup(self, warmup_steps=2000):
         #add warmup transitions to buffer
-        for step in range(self.num_steps_per_iteration):
+        state = self.env.reset()
+        traj_length = 0
+        traj_reward = 0
+        for step in range(warmup_steps):
             action, _ = self.agent.select_action(state)
             next_state, reward, done, _ = self.env.step(action)
             traj_length  += 1
@@ -82,14 +87,16 @@ class MBPOTrainer(BaseTrainer):
             iteration_start_time = time()
 
 
-            rollout_step = self.rollout_step_generator.next()
+            model_rollout_steps = self.rollout_step_generator.next()
 
             #train model on env_buffer via maximum likelihood
+            print("\033[32m -------------------model training----------------------\033[0m")
             data_batch = self.env_buffer.sample_batch(self.batch_size)
             model_loss_dict = self.agent.train_model(data_batch)
             #for e steps do
             for step in range(self.num_steps_per_iteration):
                 #take action in environment according to \pi, add to D_env
+                # print("select action")
                 action, _ = self.agent.select_action(state)
                 next_state, reward, done, _ = self.env.step(action)
                 traj_length  += 1
@@ -109,49 +116,57 @@ class MBPOTrainer(BaseTrainer):
                 tot_env_steps += 1
 
                 #for m model rollouts do
-                for rollout_step in range(self.num_model_rollouts):
+                # print("\033[32m -------------------model rollout----------------------\033[0m")
+                for iter in range(self.num_model_rollouts):
                     #sample s_t uniformly from D_env
-                    data_batch = self.env_buffer.sample(self.rollout_batch_size)
+                    state_batch, action_batch, next_state_batch, reward_batch, done_batch = self.env_buffer.sample_batch(self.rollout_batch_size)
                     #perform k-step model rollout starting from s_t using policy\pi
-                    generated_transitions = self.agent.rollout(data_batch, rollout_step)
+                    generated_transitions = self.agent.rollout(state_batch, model_rollout_steps)
                     #add the transitions to D_model
                     for s, a, ns, r, d in zip(generated_transitions['state'], \
                                                 generated_transitions['action'], \
                                                 generated_transitions['next_state'], \
                                                 generated_transitions['reward'], \
                                                 generated_transitions['done']):
-                        self.model_buffer.add_transition(s, a, ns, r, d)
+                        self.model_buffer.add_tuple(s, a, ns, r, d)
 
                 #for G gradient updates do
+                # print("\033[32m -------------------policy update----------------------\033[0m")
                 for update_step in range(self.num_updates_per_epoch):
-                    data_batch = self.model_buffer.sample_batch(self.batch_size)
-                    policy_loss_dict = self.agent.update(data_batch)
+                    model_data_batch = self.model_buffer.sample_batch(int(self.batch_size * self.model_env_ratio))
+                    env_data_batch = self.env_buffer.sample_batch(int(self.batch_size * (1 - self.model_env_ratio)))
+                    # print(model_data_batch.shape, env_data_batch.shape)
+                    # data_batch = torch.cat((model_data_batch, env_data_batch))
+                    policy_loss_dict_model = self.agent.update(model_data_batch)
+                    policy_loss_dict_env = self.agent.update(env_data_batch)
            
             iteration_end_time = time()
             iteration_duration = iteration_end_time - iteration_start_time
             iteration_durations.append(iteration_duration)
-            if ite % self.log_interval == 0:
+            if epoch % self.log_interval == 0:
                 for loss_name in model_loss_dict:
-                    self.logger.log_var(loss_name, loss_dict[loss_name], tot_env_steps)
-                for loss_name in policy_loss_dict:
-                    self.logger.log_var(loss_name, loss_dict[loss_name], tot_env_steps)
-            if ite % self.test_interval == 0:
+                    self.logger.log_var(loss_name, model_loss_dict[loss_name], tot_env_steps)
+                for loss_name in policy_loss_dict_model:
+                    self.logger.log_var(loss_name, policy_loss_dict_model[loss_name], tot_env_steps)
+                for loss_name in policy_loss_dict_env:
+                    self.logger.log_var(loss_name, policy_loss_dict_env[loss_name], tot_env_steps)
+            if epoch % self.test_interval == 0:
                 log_dict = self.test()
                 avg_test_reward = log_dict['return/test']
                 for log_key in log_dict:
                     self.logger.log_var(log_key, log_dict[log_key], tot_env_steps)
-                remaining_seconds = int((self.max_iteration - ite + 1) * np.mean(iteration_durations[-100:]))
+                remaining_seconds = int((self.max_epoch - epoch + 1) * np.mean(iteration_durations[-100:]))
                 time_remaining_str = second_to_time_str(remaining_seconds)
-                summary_str = "iteration {}/{}:\ttrain return {:.02f}\ttest return {:02f}\teta: {}".format(ite, self.max_iteration, train_traj_rewards[-1],avg_test_reward,time_remaining_str)
+                summary_str = "iteration {}/{}:\ttrain return {:.02f}\ttest return {:02f}\teta: {}".format(epoch, self.max_epoch, train_traj_rewards[-1],avg_test_reward,time_remaining_str)
                 self.logger.log_str(summary_str)
-            if ite % self.save_model_interval == 0:
-                self.agent.save_model(self.logger.log_dir, ite)
-            if ite % self.save_video_demo_interval == 0:
-                self.save_video_demo(ite)
+            if epoch % self.save_model_interval == 0:
+                self.agent.save_model(self.logger.log_dir, epoch)
+            if epoch % self.save_video_demo_interval == 0:
+                self.save_video_demo(epoch)
 
 
     def test(self):
-        #print("\033[32m -------------------testing----------------------\033[0m")
+        print("\033[32m -------------------testing----------------------\033[0m")
         rewards = []
         lengths = []
         for episode in range(self.num_test_trajectories):

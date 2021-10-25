@@ -9,17 +9,18 @@ from mbpo.agent import MBPOAgent
 from common.util import set_device_and_logger, load_config, set_global_seed
 from common.buffer import PrioritizedReplayBuffer, ReplayBuffer
 from common.env_wrapper import ScaleRewardWrapper
-from  common import util
+from common import util
+from common.scheduler import Scheduler
 
 @click.command(context_settings=dict(
     ignore_unknown_options=True,
     allow_extra_args=True,
 ))
-@click.argument("config-path",type=str, default="sac/configs/default_with_per.json")
+@click.argument("config-path",type=str, default="mbpo/configs/default_with_per.json")
 @click.option("--log-dir", default="sac/logs")
 @click.option("--gpu", type=int, default=-1)
 @click.option("--print-log", type=bool, default=True)
-@click.option("--seed", type=int, default=35)
+@click.option("--seed", type=int, default=30)
 @click.option("--info", type=str, default="")
 @click.argument('args', nargs=-1)
 def main(config_path, log_dir, gpu, print_log, seed, info, args):
@@ -63,7 +64,7 @@ def main(config_path, log_dir, gpu, print_log, seed, info, args):
     agent = MBPOAgent(state_space, action_space, **args['agent'])
 
     #initialized generator 
-    rollout_step_generator = todo
+    rollout_step_generator = Scheduler(initial_val=args['trainer']['num_rollout_steps'], schedule_type='identical')
     #initialize trainer
     logger.log_str("Initializing Trainer")
     trainer  = MBPOTrainer(
@@ -72,6 +73,7 @@ def main(config_path, log_dir, gpu, print_log, seed, info, args):
         eval_env,
         env_buffer,
         model_buffer,
+        rollout_step_generator,
         logger,
         **args['trainer']
     )

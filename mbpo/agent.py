@@ -2,11 +2,11 @@ import torch
 import torch.nn.functional as F
 import gym 
 import os
-from torch import nn
+from torch import mean, nn, var
 from common.agents import BaseAgent
 from common.networks import QNetwork, VNetwork, PolicyNetwork, get_optimizer
 from common.buffer import ReplayBuffer
-from common.models import BaseModel
+from common.models import BaseModel, EnsembleModel, PredictEnv
 import numpy as np
 from common import util 
 
@@ -31,8 +31,7 @@ class MBPOAgent(torch.nn.Module, BaseAgent):
         self.target_q1_network = QNetwork(state_dim + action_dim, 1,**kwargs['q_network'])
         self.target_q2_network = QNetwork(state_dim + action_dim, 1,**kwargs['q_network'])
         self.policy_network = PolicyNetwork(state_dim, action_space,  ** kwargs['policy_network'])
-        self.transition_model = BaseModel(state_dim + action_dim, state_dim, **kwargs['transition_model'])
-        self.reward_model = BaseModel(state_dim + action_dim,1 , **kwargs['transition_model'])
+        self.transition_model = EnsembleModel(state_dim, action_dim, **kwargs['transition_model'])
 
         #sync network parameters
         util.hard_update_network(self.q1_network, self.target_q1_network)
@@ -45,14 +44,15 @@ class MBPOAgent(torch.nn.Module, BaseAgent):
         self.target_q2_network = self.target_q2_network.to(util.device)
         self.policy_network = self.policy_network.to(util.device)
         self.transition_model = self.transition_model.to(util.device)
-        self.reward_model = self.reward_model.to(util.device)
 
         #initialize optimizer
         self.q1_optimizer = get_optimizer(network = self.q1_network, **kwargs['q_network'])
         self.q2_optimizer = get_optimizer(network = self.q2_network, **kwargs['q_network'])
         self.policy_optimizer = get_optimizer(network = self.policy_network, **kwargs['policy_network'])
         self.transition_optimizer = get_optimizer(network = self.transition_model, **kwargs['transition_model'])
-        self.reward_optimizer = get_optimizer(network = self.reward_model, **kwargs['reward_model'])
+
+        #initialize predict env
+        self.predict_env = PredictEnv(self.transition_model, kwargs['transition_model']['env_name'])
 
         #hyper-parameters
         self.gamma = kwargs['gamma']
@@ -65,31 +65,63 @@ class MBPOAgent(torch.nn.Module, BaseAgent):
         self.tot_update_count = 0 
         self.update_target_network_interval = update_target_network_interval
         self.target_smoothing_tau = target_smoothing_tau
+        self.holdout_ratio = kwargs['transition_model']['holdout_ratio']
+        self.inc_var_loss = kwargs['transition_model']['inc_var_loss']
 
 
     def train_model(self, data_batch):
-        state_batch, action_batch, next_state_batch, reward_batch = data_batch
-        next_state_prediction = self.transition_model(state_batch, action_batch)
-        reward_prediction = self.reward_model(state_batch, action_batch)
+        #compute the number of holdout samples
+        batch_size = data_batch[0].shape[0]
+        assert(batch_size == 100)
+        num_holdout = int(batch_size * self.holdout_ratio)
+
+        #permutate samples
+        permutation = np.random.permutation(batch_size)
+        state_batch, action_batch, next_state_batch, reward_batch, done_batch = data_batch
+        state_batch, action_batch, next_state_batch, reward_batch = \
+            state_batch[permutation], action_batch[permutation], next_state_batch[permutation], reward_batch[permutation]
+
+        #divide samples into training samples and testing samples
+        train_state_batch, train_action_batch, train_next_state_batch, train_reward_batch = \
+            state_batch[num_holdout:], action_batch[num_holdout:], next_state_batch[num_holdout:], reward_batch[num_holdout:]
+        test_state_batch, test_action_batch, test_next_state_batch, test_reward_batch = \
+            state_batch[:num_holdout], action_batch[:num_holdout], next_state_batch[:num_holdout], reward_batch[:num_holdout]
+
+        #predict with model
+        predictions = self.transition_model.predict(train_state_batch, train_action_batch)
         
-        #compute loss
-        state_prediction_loss = F.mse_loss(next_state_prediction, next_state_batch)
-        state_prediction_loss_value = state_prediction_loss.detach().cpu().numpy()
-        reward_prediction_loss = F.mse_loss(reward_prediction, reward_batch)
-        reward_loss_value = reward_prediction_loss.detach().cpu().numpy()
+        #compute training loss
+        state_reward = torch.cat((train_next_state_batch - train_state_batch, train_reward_batch), dim=1)
+        train_loss = sum(self.model_loss(predictions, state_reward))
         
         #back propogate
         self.transition_optimizer.zero_grad()
-        state_prediction_loss.backward()
+        train_loss.backward()
         self.transition_optimizer.step()
-        self.reward_optimizer.zero_grad()
-        reward_prediction_loss.backward()
-        self.reward_optimizer.step()
+
+        #compute testing loss
+        with torch.no_grad():
+            test_predictions = self.transition_model.predict(test_state_batch, test_action_batch)
+            test_state_reward = torch.cat((test_next_state_batch - test_state_batch, test_reward_batch), dim=1)
+            test_loss = sum(self.model_loss(test_predictions, test_state_reward))
+            idx = np.argsort(test_loss.detach().cpu())
+            self.transition_model.elite_model_idxes = idx[:self.transition_model.num_elite]
         
         return {
-            "transition_loss": state_prediction_loss_value,
-            "reward_loss": reward_loss_value
+            "train_transition_loss": train_loss,
+            "test_transition_loss": test_loss
         }
+
+    def model_loss(self, predictions, trues):
+        loss = []
+        for (means, vars) in predictions:
+            if self.inc_var_loss:
+                mean_loss = torch.mean(torch.mean(torch.pow(means - trues, 2) * (1/vars), dim=-1), dim=-1)
+                var_loss = torch.mean(torch.mean(torch.log(vars), dim=-1), dim=-1)
+                loss.append(mean_loss + var_loss)
+            else:
+                loss.append(torch.mean(torch.mean(torch.pow(means - trues, 2), dim=-1), dim=-1))
+        return loss
 
 
     def update(self, data_batch):
@@ -181,13 +213,19 @@ class MBPOAgent(torch.nn.Module, BaseAgent):
             util.soft_update_network(self.q2_network, self.target_q2_network, self.target_smoothing_tau)
             
     def select_action(self, state, evaluate=False):
-        if type(state) != torch.tensor:
-            state = torch.FloatTensor([state]).to(util.device)
+        if type(state) != torch.Tensor:
+            if len(state.shape) == 1:
+                state = torch.FloatTensor([state]).to(util.device)
+            else:
+                state = torch.FloatTensor(state).to(util.device)
         action, log_prob, mean = self.policy_network.sample(state)
+        if np.isnan(action.detach().cpu().numpy()).any():
+            print(list(self.policy_network.parameters()))
+            assert 0
         if evaluate:
-            return mean.detach().cpu().numpy()[0], log_prob
+            return mean.detach().cpu().numpy(), log_prob
         else:
-            return action.detach().cpu().numpy()[0], log_prob
+            return action.detach().cpu().numpy(), log_prob
 
 
     def save_model(self, target_dir, ite):
@@ -212,6 +250,30 @@ class MBPOAgent(torch.nn.Module, BaseAgent):
         policy_network_path = os.path.join(model_dir, "policy_network.pt")
         self.policy_network.load_state_dict(torch.load(policy_network_path))
 
+    def rollout(self, state_batch, model_rollout_steps):
+        state_set = np.array([])
+        action_set = np.array([])
+        next_state_set = np.array([])
+        reward_set = np.array([])
+        done_set = np.array([])
+        state = state_batch.detach().cpu().numpy()
+        for step in range(model_rollout_steps):
+            action, log_prob = self.select_action(state)
+            next_state, reward, done, info = self.predict_env.step(state, action)
+            if step == 0:
+                state_set = state
+                action_set = action
+                next_state_set = next_state
+                reward_set = reward
+                done_set = done
+            else:
+                state_set = np.concatenate((state_set, state), 0)
+                action_set = np.concatenate((action_set, action), 0)
+                next_state_set = np.concatenate((next_state_set, next_state), 0)
+                reward_set = np.concatenate((reward_set, reward), 0)
+                done_set = np.concatenate((done_set, done), 0)
+        assert(state_set.shape[1] == 11)
+        return {'state': state_set, 'action': action_set, 'reward': reward_set, 'next_state': next_state_set, 'done': done_set}
 
         
 
