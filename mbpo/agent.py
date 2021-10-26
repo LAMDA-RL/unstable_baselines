@@ -212,16 +212,15 @@ class MBPOAgent(torch.nn.Module, BaseAgent):
             util.soft_update_network(self.q1_network, self.target_q1_network, self.target_smoothing_tau)
             util.soft_update_network(self.q2_network, self.target_q2_network, self.target_smoothing_tau)
             
-    def select_action(self, state, evaluate=False):
+    def select_action(self, state, evaluate=False, step=1):
         if type(state) != torch.Tensor:
             if len(state.shape) == 1:
                 state = torch.FloatTensor([state]).to(util.device)
             else:
                 state = torch.FloatTensor(state).to(util.device)
         action, log_prob, mean = self.policy_network.sample(state)
-        if np.isnan(action.detach().cpu().numpy()).any():
+        if np.isnan(action.detach().cpu().numpy()).any() or step % 50 == 0:
             print(list(self.policy_network.parameters()))
-            assert 0
         if evaluate:
             return mean.detach().cpu().numpy(), log_prob
         else:

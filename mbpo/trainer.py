@@ -97,7 +97,7 @@ class MBPOTrainer(BaseTrainer):
             for step in range(self.num_steps_per_iteration):
                 #take action in environment according to \pi, add to D_env
                 # print("select action")
-                action, _ = self.agent.select_action(state)
+                action, _ = self.agent.select_action(state, step=step)
                 next_state, reward, done, _ = self.env.step(action)
                 traj_length  += 1
                 traj_reward += reward
